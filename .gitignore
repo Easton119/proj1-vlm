@@ -1,0 +1,31 @@
+# 构建产物
+build/
+install/
+*.o
+*.out
+
+# 模型（大文件，绝不进 git）
+models/
+*.rknn
+*.rkllm
+*.onnx
+*.bin
+*.gguf
+
+# 运行库
+lib/
+*.so
+*.so.*
+
+# 第三方头文件（体积大且可重下）
+include/rknn_inc/
+include/rkllm_inc/
+include/pocketfft_inc/
+include/miniaudio.h
+eigen*/
+
+
+# 编辑器/系统
+.vscode/
+*.swp
+.DS_Store
