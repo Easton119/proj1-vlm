@@ -24,6 +24,8 @@
 #include "audio_enc.h"
 #include "audio_utils.h"
 #include "rkllm.h"
+#include "v4l2_capture.h"
+#include "rga_converter.h"
 
 using namespace std;
 LLMHandle llmHandle = nullptr;
@@ -240,7 +242,11 @@ int main(int argc, char** argv)
     const int core_num = atoi(argv[8]);
 
     float* img_vec = NULL;
-     cv::VideoCapture camera;   // ★ 新增
+    // cv::VideoCapture camera;   // ★ 新增
+
+    V4l2MjpgCapture capture;
+    RgaConverter rga;
+
     size_t n_image_tokens = 0;
     size_t image_width = 0;
     size_t image_height = 0;
@@ -315,12 +321,19 @@ int main(int argc, char** argv)
         memset(img_vec, 0, rkllm_image_embed_len * sizeof(float));
 
         // 打开摄像头（只打开一次；21 对应 /dev/video21，按你的实际节点改）
-        camera.open(21);
-        if (!camera.isOpened()) {
-            printf("camera open fail! node=21\n");
-            exit_code = -1;
-            goto exit_cleanup;
+        // camera.open(21);
+        // if (!camera.isOpened()) {
+        //     printf("camera open fail! node=21\n");
+        //     exit_code = -1;
+        //     goto exit_cleanup;
+        // }
+
+        if (!capture.open("/dev/video21", 1280, 720)) {
+        printf("V4L2 open failed\n");
+        exit_code = -1;
+        goto exit_cleanup;
         }
+
         printf("camera opened\n");
 
     }
@@ -475,24 +488,41 @@ int main(int argc, char** argv)
 
         // ★ 每次提问前：抓当前帧 → 预处理 → 重跑视觉编码器，更新 img_vec
         if (has_image && enable_image) {
-            cv::Mat frame;
-            camera >> frame;                       // 抓"当前"一帧
-            if (frame.empty()) {
-                printf("[Warning] camera frame empty, skip this turn\n");
+
+            std::vector<uint8_t> mjpg;
+            if (!capture.read_frame(mjpg)) continue;                     // V4L2 取一帧 MJPG
+            cv::Mat frame = cv::imdecode(mjpg, cv::IMREAD_COLOR);  // OpenCV 解码 → BGR
+            if (frame.empty()) { printf("[Warning] decode failed\n"); continue; }
+
+            // 扩方保留（CPU），避免直接 resize 变形
+            cv::Mat square_img = expand2square(frame, cv::Scalar(127.5, 127.5, 127.5));
+
+            // ★ RGA：BGR→RGB + resize 448（替代原来的 cvtColor + resize）
+            cv::Mat rgb;
+            if (!rga.to_rgb(square_img, image_width, image_height, &rgb)) {
+                printf("[Warning] rga failed\n");
                 continue;
             }
-            cv::cvtColor(frame, frame, cv::COLOR_BGR2RGB);
-            cv::Mat square_img = expand2square(frame, cv::Scalar(127.5, 127.5, 127.5));
-            cv::Mat resized_img;
-            cv::resize(square_img, resized_img, cv::Size(image_width, image_height), 0, 0, cv::INTER_LINEAR);
+            // 临时对比：OpenCV 做同样的 BGR→RGB + resize
+            auto c0 = std::chrono::high_resolution_clock::now();
+            cv::Mat tmp;
+            cv::cvtColor(square_img, tmp, cv::COLOR_BGR2RGB);
+            cv::resize(tmp, tmp, cv::Size(image_width, image_height), 0, 0, cv::INTER_LINEAR);
+            auto c1 = std::chrono::high_resolution_clock::now();
+            printf("[OpenCV] in %ld us\n",
+                std::chrono::duration_cast<std::chrono::microseconds>(c1 - c0).count());
 
             auto t0 = std::chrono::high_resolution_clock::now();
-            ret = run_imgenc(&rknn_app_ctx, resized_img.data, img_vec);
+            ret = run_imgenc(&rknn_app_ctx, rgb.data, img_vec);
             auto t1 = std::chrono::high_resolution_clock::now();
             if (ret != 0) {
                 printf("run_imgenc fail! ret=%d\n", ret);
                 continue;
             }
+
+            
+
+
             printf("[ImgEnc] %.2f ms\n",
                 std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.0);
         }
@@ -531,7 +561,7 @@ int main(int argc, char** argv)
     }
 
 exit_cleanup:
-    if (camera.isOpened()) camera.release();   // ★ 新增
+    //if (camera.isOpened()) camera.release();   // ★ 新增
     if (enable_image) {
         ret = release_imgenc(&rknn_app_ctx);
         if (ret != 0) {
