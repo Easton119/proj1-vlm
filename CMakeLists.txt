@@ -34,6 +34,7 @@ add_executable(demo
   src/audio_utils.cc
   src/v4l2_capture.cpp
   src/rga_converter.cpp
+  src/camera_stream.cpp
 )
 # add_executable(目标名 源文件...)：把列出的 .cpp 编译并链接成一个叫 demo 的可执行文件；
 
