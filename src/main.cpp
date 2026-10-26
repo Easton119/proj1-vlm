@@ -1,591 +1,278 @@
-// Copyright (c) 2025 by Rockchip Electronics Co., Ltd. All Rights Reserved.
+// main.cpp —— 阶段 D：语音提问 + 摄像头实时帧 + VLM 回答
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// 三个线程：
+//   1) 语音线程（voice::Engine 内部还有采集线程）
+//   2) VLM 线程：从"单槽队列"取问题 → 抓最新帧 → 视觉编码 → 生成
+//   3) stdin 线程：保留打字提问的调试方式（不打字也不影响语音）
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// 关键：语音识别出的文本在 VlmEngine::Ask 里会被加上 "<image>" 前缀，
+// 否则 RKLLM 不会把它当多模态输入，模型就不会看图。
 
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include <condition_variable>
+#include <csignal>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <deque>
 #include <iostream>
-#include <fstream>
+#include <mutex>
 #include <chrono>
-#include <opencv2/opencv.hpp>
-#include "image_enc.h"
-#include "audio_enc.h"
-#include "audio_utils.h"
-#include "rkllm.h"
-#include "v4l2_capture.h"
-#include "rga_converter.h"
-#include "camera_stream.h"
+#include <string>
+#include <thread>
 
-using namespace std;
-LLMHandle llmHandle = nullptr;
+#include "vlm_engine.h"
+#include "voice_engine.h"
+#include "tts_engine.h"
 
-// IEEE-754 binary16 (half) conversion for the RKNN audio encoder inputs.
-// The RKNN model io tensors are float16; feeding float32 bytes while declaring
-// RKNN_TENSOR_FLOAT16 causes the runtime to misinterpret the data.
-static inline uint16_t fp32_to_fp16(float f)
-{
-    union { float f; uint32_t u; } v = { f };
-    uint32_t u = v.u;
-    uint32_t sign = (u >> 16) & 0x8000;
-    int32_t exp = (int32_t)((u >> 23) & 0xff) - 127 + 15;
-    uint32_t mant = u & 0x7fffff;
-    if (exp >= 31) {
-        // overflow -> Inf
-        return (uint16_t)(sign | 0x7c00);
-    }
-    if (exp <= 0) {
-        if (exp < -10) {
-            return (uint16_t)sign;                       // underflow -> 0
-        }
-        mant |= 0x800000;                                // implicit leading 1
-        uint32_t shift = (uint32_t)(14 - exp);
-        uint32_t half_mant = mant >> shift;
-        uint32_t rem = mant & ((1u << shift) - 1);
-        uint32_t round = (rem > (1u << (shift - 1))) ||
-                         ((rem == (1u << (shift - 1))) && (half_mant & 1));
-        return (uint16_t)(sign | (half_mant + round));
-    }
-    uint32_t half_mant = mant >> 13;
-    uint32_t rem = mant & 0x1fff;
-    uint32_t round = (rem > 0x1000) || ((rem == 0x1000) && (half_mant & 1));
-    return (uint16_t)(sign | ((uint32_t)exp << 10) | (half_mant + round));
+namespace {
+
+volatile std::sig_atomic_t g_running = 1;
+void OnSignal(int) { g_running = 0; }
+
+struct Args {
+  VlmConfig vlm;
+  bool voice_enabled = false;
+  voice::Config voice;
+  bool tts_enabled = false;     // 新增
+  TtsConfig tts;                // 新增
+};
+
+void PrintUsage(const char* p) {
+  std::fprintf(
+      stderr,
+      "usage: %s --llm=<rkllm> --vision=<rknn> [options]\n"
+      "  VLM:\n"
+      "    --camera=/dev/video21  --width=1280  --height=720\n"
+      "    --max-new-tokens=256   --max-context-len=4096\n"
+      "    --npu-core=3           --platform=rk3588\n"
+      "  Voice (全部给出才启用):\n"
+      "    --voice --keywords-file= --kws-tokens= --kws-encoder=\n"
+      "    --kws-decoder= --kws-joiner= --asr-model= --asr-tokens=\n"
+      "    --vad-model= [--device=plughw:2,0] [--language=zh]\n"
+      "    [--kws-threshold=0.25] [--vad-threshold=0.25]\n"
+      "    [--command-timeout-ms=8000] [--cooldown-ms=1500]\n",
+      p);
 }
 
-static inline void vec_fp32_to_fp16(const std::vector<float>& src, std::vector<uint16_t>& dst)
-{
-    dst.resize(src.size());
-    for (size_t i = 0; i < src.size(); i++) {
-        dst[i] = fp32_to_fp16(src[i]);
+// 返回 1 继续，0 参数错误
+int ParseArgs(int argc, char** argv, Args* a) {
+  for (int i = 1; i < argc; ++i) {
+    std::string arg = argv[i];
+    if (arg == "--voice") { a->voice_enabled = true; continue; }
+    if (arg == "--tts") { a->tts_enabled = true; continue; }
+    if (arg.rfind("--", 0) != 0) {
+      std::fprintf(stderr, "unexpected argument: %s\n", arg.c_str());
+      return 0;
     }
-}
-
-void exit_handler(int signal)
-{
-    if (llmHandle != nullptr)
-    {
-        {
-            cout << "程序即将退出" << endl;
-            LLMHandle _tmp = llmHandle;
-            llmHandle = nullptr;
-            rkllm_destroy(_tmp);
-        }
-    }
-    exit(signal);
-}
-
-int callback(RKLLMResult *result, void *userdata, LLMCallState state)
-{
-
-    if (state == RKLLM_RUN_FINISH)
-    {
-        printf("\n");
-    }
-    else if (state == RKLLM_RUN_ERROR)
-    {
-        printf("\\run error\n");
-    }
-    else if (state == RKLLM_RUN_NORMAL)
-    {
-        printf("%s", result->text);
-        // for(int i=0; i<result->num; i++)
-        // {
-        //     printf("%d token_id: %d logprob: %f\n", i, result->tokens[i].id, result->tokens[i].logprob);
-        // }
-    }
-    return 0;
-}
-
-// Expand the image into a square and fill it with the specified background color
-cv::Mat expand2square(const cv::Mat& img, const cv::Scalar& background_color) {
-    int width = img.cols;
-    int height = img.rows;
-
-    // If the width and height are equal, return to the original image directly
-    if (width == height) {
-        return img.clone();
-    }
-
-    // Calculate the new size and create a new image
-    int size = std::max(width, height);
-    cv::Mat result(size, size, img.type(), background_color);
-
-    // Calculate the image paste position
-    int x_offset = (size - width) / 2;
-    int y_offset = (size - height) / 2;
-
-    // Paste the original image into the center of the new image
-    cv::Rect roi(x_offset, y_offset, width, height);
-    img.copyTo(result(roi));
-
-    return result;
-}
-
-static bool is_empty_arg(const char* arg)
-{
-    return arg == NULL || arg[0] == '\0';
-}
-
-int main(int argc, char** argv)
-{
-    if (argc < 10) {
-        std::cerr << "Usage: " << argv[0]
-                << " image_path img_encoder_model_path audio_path aud_encoder_model_path llm_model_path max_new_tokens max_context_len rknn_core_num platform "
-                << "  platform: rk3588 | rk3576 | rk3562 | rv1126b\n"
-                << "  Note: pass \"\" for image_path/img_encoder_model_path or audio_path/aud_encoder_model_path to disable that modality\n";
-        return -1;
-    }
-
-    const char * image_path = argv[1];
-    const char * img_encoder_model_path = argv[2];
-    const char * audio_path = argv[3];
-    const char * aud_encoder_model_path = argv[4];
-
-    bool enable_image = !is_empty_arg(image_path) && !is_empty_arg(img_encoder_model_path);
-    bool enable_audio = !is_empty_arg(audio_path) && !is_empty_arg(aud_encoder_model_path);
-    if (is_empty_arg(image_path) != is_empty_arg(img_encoder_model_path)) {
-        std::cerr << "[Warning] image_path and img_encoder_model_path must be both provided or both empty; image disabled\n";
-        enable_image = false;
-    }
-    if (is_empty_arg(audio_path) != is_empty_arg(aud_encoder_model_path)) {
-        std::cerr << "[Warning] audio_path and aud_encoder_model_path must be both provided or both empty; audio disabled\n";
-        enable_audio = false;
-    }
-    printf("enable_image=%d, enable_audio=%d\n", enable_image ? 1 : 0, enable_audio ? 1 : 0);
-
-    RKLLMParam param = rkllm_createDefaultParam();
-    param.model_path = argv[5];
-    param.top_k = 1;
-    param.max_new_tokens = std::atoi(argv[6]);
-    param.max_context_len = std::atoi(argv[7]);
-    param.skip_special_token = true;
-    param.extend_param.base_domain_id = 0;
-
-    const char* platform = argv[9];
-    if (strcmp(platform, "rv1126b") == 0 || strcmp(platform, "rk3562") == 0) {
-        param.extend_param.base_domain_id = 0;
-    } else if (strcmp(platform, "rk3588") == 0 || strcmp(platform, "rk3576") == 0) {
-        param.extend_param.base_domain_id = 1;
+    std::string key, value;
+    const size_t eq = arg.find('=');
+    if (eq != std::string::npos) {
+      key = arg.substr(2, eq - 2);
+      value = arg.substr(eq + 1);
     } else {
-        std::cerr << "Error: Unknown platform '" << platform
-                  << "'. Supported: rk3588, rk3576, rk3562, rv1126b\n";
-        return -1;
+      key = arg.substr(2);
+      if (i + 1 >= argc) { std::fprintf(stderr, "missing value: --%s\n", key.c_str()); return 0; }
+      value = argv[++i];
     }
 
-    const char* img_start   = "<|vision_start|>";
-    const char* img_end     = "<|vision_end|>";
-    const char* img_content = "<|image_pad|>";
-    const char* audio_start   = "<|audio>";
-    const char* audio_end     = "<audio|>";
-    const char* audio_content = "<|audio|>";
+    if (key == "llm") a->vlm.llm_model = value;
+    else if (key == "vision") a->vlm.vision_model = value;
+    else if (key == "camera") a->vlm.camera_device = value;
+    else if (key == "width") a->vlm.camera_width = std::atoi(value.c_str());
+    else if (key == "height") a->vlm.camera_height = std::atoi(value.c_str());
+    else if (key == "max-new-tokens") a->vlm.max_new_tokens = std::atoi(value.c_str());
+    else if (key == "max-context-len") a->vlm.max_context_len = std::atoi(value.c_str());
+    else if (key == "npu-core") a->vlm.npu_core_num = std::atoi(value.c_str());
+    else if (key == "platform") a->vlm.platform = value;
+    else if (key == "device") a->voice.device = value;
+    else if (key == "keywords-file") a->voice.keywords_file = value;
+    else if (key == "kws-tokens") a->voice.kws_tokens = value;
+    else if (key == "kws-encoder") a->voice.kws_encoder = value;
+    else if (key == "kws-decoder") a->voice.kws_decoder = value;
+    else if (key == "kws-joiner") a->voice.kws_joiner = value;
+    else if (key == "asr-model") a->voice.asr_model = value;
+    else if (key == "asr-tokens") a->voice.asr_tokens = value;
+    else if (key == "vad-model") a->voice.vad_model = value;
+    else if (key == "language") a->voice.language = value;
+    else if (key == "threads") a->voice.threads = std::atoi(value.c_str());
+    else if (key == "kws-threshold") a->voice.kws_threshold = std::atof(value.c_str());
+    else if (key == "vad-threshold") a->voice.vad_threshold = std::atof(value.c_str());
+    else if (key == "command-timeout-ms") a->voice.command_timeout_ms = std::atoi(value.c_str());
+    else if (key == "cooldown-ms") a->voice.cooldown_ms = std::atoi(value.c_str());
+    else if (key == "tts-model") a->tts.model = value;
+    else if (key == "tts-lexicon") a->tts.lexicon = value;
+    else if (key == "tts-tokens") a->tts.tokens = value;
+    else if (key == "tts-device") a->tts.device = value;
+    else if (key == "tts-threads") a->tts.num_threads = std::atoi(value.c_str());
+    else if (key == "tts-sid") a->tts.sid = std::atoi(value.c_str());
+    else if (key == "tts-speed") a->tts.speed = static_cast<float>(std::atof(value.c_str()));
+    else if (key == "tts-dump") a->tts.dump_dir = value;
+    else { std::fprintf(stderr, "unknown option: --%s\n", key.c_str()); return 0; }
+  }
+  if (a->vlm.llm_model.empty() || a->vlm.vision_model.empty()) return 0;
 
-    // Gemma4
-    // const char* img_start   = "<|image>";
-    // const char* img_end     = "<image|>";
-    // const char* img_content = "<|image|>";
+  if (a->voice_enabled) {
+    const std::string* req[] = {&a->voice.keywords_file, &a->voice.kws_tokens,
+                                &a->voice.kws_encoder, &a->voice.kws_decoder,
+                                &a->voice.kws_joiner, &a->voice.asr_model,
+                                &a->voice.asr_tokens, &a->voice.vad_model};
+    for (const auto* s : req) {
+      if (s->empty()) {
+        std::fprintf(stderr, "[voice] missing model paths\n");
+        return 0;
+      }
+    }
+  }
+  if (a->tts_enabled) {
+    if (a->tts.model.empty() || a->tts.lexicon.empty() ||
+        a->tts.tokens.empty()) {
+      std::fprintf(stderr, "[tts] need --tts-model/--tts-lexicon/--tts-tokens\n");
+      return 0;
+    }
+  }
+  return 1;
+}
 
-    //DeepSeekOCR
-    // img_start   = "";
-    // img_end     = "";
-    // img_content = "<｜▁pad▁｜>";
+std::string Trim(std::string s) {
+  const size_t b = s.find_first_not_of(" \t\r\n");
+  if (b == std::string::npos) return "";
+  const size_t e = s.find_last_not_of(" \t\r\n");
+  return s.substr(b, e - b + 1);
+}
 
-    if (argc > 10) img_start   = argv[10];
-    if (argc > 11) img_end     = argv[11];
-    if (argc > 12) img_content = argv[12];
-    if (argc > 13) audio_start   = argv[13];
-    if (argc > 14) audio_end     = argv[14];
-    if (argc > 15) audio_content = argv[15];
+}  // namespace
 
-    std::cerr << "[Warning] Using img_start/img_end/img_content: "
-                << img_start << " , "
-                << img_end << " , "
-                << img_content
-                << ". Please customize these values according to your model, "
-                << "otherwise the output may be incorrect.\n";
-    std::cerr << "[Warning] Using audio_start/audio_end/audio_content: "
-            << audio_start << " , "
-            << audio_end << " , "
-            << audio_content
-            << ". Please customize these values according to your model, "
-            << "otherwise the output may be incorrect.\n";
+int main(int argc, char** argv) {
+  Args args;
+  if (!ParseArgs(argc, argv, &args)) {
+    PrintUsage(argv[0]);
+    return 2;
+  }
 
-    int ret;
-    int exit_code = 0;
-    std::chrono::high_resolution_clock::time_point t_start_us = std::chrono::high_resolution_clock::now();
-    RKLLMCallback rkllm_callback = {};
-    rkllm_callback.result_callback = callback;
-    ret = rkllm_init(&llmHandle, &param, &rkllm_callback);
-    if (ret == 0){
-        printf("rkllm init success\n");
+  std::signal(SIGINT, OnSignal);
+  std::signal(SIGTERM, OnSignal);
+
+  VlmEngine vlm;
+  if (!vlm.Init(args.vlm)) {
+    std::fprintf(stderr, "[main] vlm init failed\n");
+    return 1;
+  }
+
+  TtsEngine tts;
+  bool tts_started = false;
+  if (args.tts_enabled) {
+    if (!tts.Init(args.tts)) {
+      std::fprintf(stderr, "[main] tts init failed, continue without TTS\n");
     } else {
-        printf("rkllm init failed\n");
-        exit_handler(-1);
+      tts_started = true;
     }
-    std::chrono::high_resolution_clock::time_point t_load_end_us = std::chrono::high_resolution_clock::now();
+  }
 
-    auto load_time = std::chrono::duration_cast<std::chrono::microseconds>(t_load_end_us - t_start_us);
-    printf("%s: LLM Model loaded in %8.2f ms\n", __func__, load_time.count() / 1000.0);
+  // ---- 单槽问题队列 ----
+  std::mutex mu;
+  std::condition_variable cv;
+  std::deque<std::string> pending;  // 容量语义：最多 1 条
+  bool running = true;
 
-    rknn_app_context_t rknn_app_ctx;
-    memset(&rknn_app_ctx, 0, sizeof(rknn_app_context_t));
-
-    const int core_num = atoi(argv[8]);
-
-    float* img_vec = NULL;
-    // cv::VideoCapture camera;   // ★ 新增
-
-    // V4l2MjpgCapture capture;
-    CameraStream camera;
-    RgaConverter rga;
-
-    size_t n_image_tokens = 0;
-    size_t image_width = 0;
-    size_t image_height = 0;
-
-    float* audio_vec = NULL;
-    size_t n_audio_tokens = 0;
-    vector<string> pre_input;
-
-    if (enable_image) {
-        t_start_us = std::chrono::high_resolution_clock::now();
-        ret = init_imgenc(img_encoder_model_path, &rknn_app_ctx, core_num);
-        if (ret != 0) {
-            printf("init_imgenc fail! ret=%d model_path=%s\n", ret, img_encoder_model_path);
-            exit_code = -1;
-            goto exit_cleanup;
-        }
-        t_load_end_us = std::chrono::high_resolution_clock::now();
-
-        load_time = std::chrono::duration_cast<std::chrono::microseconds>(t_load_end_us - t_start_us);
-        printf("%s: ImgEnc Model loaded in %8.2f ms\n", __func__, load_time.count() / 1000.0);
-            
-        // // The image is read in BGR format
-        // cv::Mat img = cv::imread(image_path);
-        // cv::cvtColor(img, img, cv::COLOR_BGR2RGB);
-
-        // // Expand the image into a square and fill it with the specified background color (According the modeling_minicpmv.py)
-        // cv::Scalar background_color(127.5, 127.5, 127.5);
-        // cv::Mat square_img = expand2square(img, background_color);
-
-        // // Resize the image
-        // image_width = rknn_app_ctx.model_width;
-        // image_height = rknn_app_ctx.model_height;
-        // cv::Mat resized_img;
-        // cv::Size new_size(image_width, image_height);
-        // cv::resize(square_img, resized_img, new_size, 0, 0, cv::INTER_LINEAR);
-
-        // n_image_tokens = rknn_app_ctx.model_image_token;
-        // size_t image_embed_len = rknn_app_ctx.model_embed_size;
-        // size_t n_embed_output = rknn_app_ctx.io_num.n_output;
-        // int rkllm_image_embed_len = n_image_tokens * image_embed_len * n_embed_output;
-        // img_vec = (float*)malloc(rkllm_image_embed_len * sizeof(float));
-        // if (!img_vec) {
-        //     printf("malloc img_vec fail!\n");
-        //     exit_code = -1;
-        //     goto exit_cleanup;
-        // }
-        // memset(img_vec, 0, rkllm_image_embed_len * sizeof(float));
-
-        // t_start_us = std::chrono::high_resolution_clock::now();
-        // ret = run_imgenc(&rknn_app_ctx, resized_img.data, img_vec);
-        // if (ret != 0) {
-        //     printf("run_imgenc fail! ret=%d\n", ret);
-        //     exit_code = -1;
-        //     goto exit_cleanup;
-        // }
-        // t_load_end_us = std::chrono::high_resolution_clock::now();
-        // load_time = std::chrono::duration_cast<std::chrono::microseconds>(t_load_end_us - t_start_us);
-        // printf("%s: ImgEnc Model inference took %8.2f ms\n", __func__, load_time.count() / 1000.0);
-
-
-        // 记录模型输入尺寸（后面每次抓帧都要用）
-        image_width  = rknn_app_ctx.model_width;
-        image_height = rknn_app_ctx.model_height;
-
-        // 分配 img_vec 缓冲（只分配一次，之后每次 run_imgenc 覆盖它）
-        n_image_tokens = rknn_app_ctx.model_image_token;
-        size_t image_embed_len = rknn_app_ctx.model_embed_size;
-        size_t n_embed_output = rknn_app_ctx.io_num.n_output;
-        int rkllm_image_embed_len = n_image_tokens * image_embed_len * n_embed_output;
-        img_vec = (float*)malloc(rkllm_image_embed_len * sizeof(float));
-        if (!img_vec) { printf("malloc img_vec fail!\n"); exit_code = -1; goto exit_cleanup; }
-        memset(img_vec, 0, rkllm_image_embed_len * sizeof(float));
-
-
-        if (!camera.start("/dev/video21", 1280, 720)) {
-            printf("camera start failed\n");
-            exit_code = -1;
-            goto exit_cleanup;
-        }
-
-        printf("camera opened\n");
-
-    }
-
-    // ---- Audio encoder ----
-    rknn_audio_context_t rknn_audio_ctx;
-    memset(&rknn_audio_ctx, 0, sizeof(rknn_audio_context_t));
-    audio_buffer_t audio;
-    memset(&audio, 0, sizeof(audio_buffer_t));
-    if (enable_audio) {
-        t_start_us = std::chrono::high_resolution_clock::now();
-        ret = init_audioenc(aud_encoder_model_path, &rknn_audio_ctx, core_num);
-        if (ret != 0) {
-            printf("init_audioenc fail! ret=%d model_path=%s\n", ret, aud_encoder_model_path);
-            exit_code = -1;
-            goto exit_cleanup;
-        }
-        t_load_end_us = std::chrono::high_resolution_clock::now();
-        load_time = std::chrono::duration_cast<std::chrono::microseconds>(t_load_end_us - t_start_us);
-        printf("%s: AudioEnc Model loaded in %8.2f ms\n", __func__, load_time.count() / 1000.0);
-
-        // Read audio (miniaudio decodes and converts to mono 16 kHz float32)
-        ret = read_audio(audio_path, &audio);
-        if (ret != 0) {
-            printf("read_audio fail! ret=%d wav_path=%s\n", ret, audio_path);
-            exit_code = -1;
-            goto exit_cleanup;
-        }
-        printf("audio: num_frames=%d, num_channels=%d, sample_rate=%d\n",
-            audio.num_frames, audio.num_channels, audio.sample_rate);
-
-        // Mel spectrogram preprocessing
-        int n_mels  = rknn_audio_ctx.model_mel_bins;
-        int n_frame = rknn_audio_ctx.model_max_frames;
-        const int n_freqs = GEMMA4_FFT_LENGTH / 2 + 1;
-
-        std::vector<float> mel_filters((size_t)n_freqs * (size_t)n_mels);
-        build_gemma4_mel_filters(mel_filters.data(), n_freqs, n_mels,
-                                GEMMA4_F_MIN, GEMMA4_F_MAX,
-                                GEMMA4_SAMPLE_RATE, GEMMA4_FFT_LENGTH);
-
-        std::vector<float> padded_feature((size_t)n_frame * (size_t)n_mels, 0.0f);
-        int actual_len = 0;
-        gemma4_audio_preprocess(&audio, mel_filters.data(), n_mels, n_frame,
-                                padded_feature, &actual_len);
-
-        // Build mask: 1 for valid frames, 0 for silence-padded frames
-        std::vector<float> padded_mask((size_t)n_frame, 0.0f);
-        for (int i = 0; i < std::min(actual_len, n_frame); i++) {
-            padded_mask[i] = 1.0f;
-        }
-
-        // Audio encoder inference
-        size_t n_audio_tokens_total = rknn_audio_ctx.model_audio_token;
-        size_t audio_embed_size     = rknn_audio_ctx.model_embed_size;
-        size_t n_audio_output       = rknn_audio_ctx.io_num.n_output;
-        printf("audio_embed_size=%zu, n_audio_output=%zu, total_embed_dim=%zu\n",
-            audio_embed_size, n_audio_output, audio_embed_size * n_audio_output);
-
-        int rkllm_audio_embed_len = n_audio_tokens_total * audio_embed_size * n_audio_output;
-        audio_vec = (float*)malloc(rkllm_audio_embed_len * sizeof(float));
-        if (!audio_vec) {
-            printf("malloc audio_vec fail!\n");
-            exit_code = -1;
-            goto exit_cleanup;
-        }
-        memset(audio_vec, 0, rkllm_audio_embed_len * sizeof(float));
-
-        t_start_us = std::chrono::high_resolution_clock::now();
-        // RKNN audio model inputs are float16; convert float32 mel/mask to half.
-        std::vector<uint16_t> padded_feature_fp16, padded_mask_fp16;
-        vec_fp32_to_fp16(padded_feature, padded_feature_fp16);
-        vec_fp32_to_fp16(padded_mask, padded_mask_fp16);
-        ret = run_audioenc(&rknn_audio_ctx, padded_feature_fp16.data(), padded_mask_fp16.data(), audio_vec);
-        if (ret != 0) {
-            printf("run_audioenc fail! ret=%d\n", ret);
-            exit_code = -1;
-            goto exit_cleanup;
-        }
-        t_load_end_us = std::chrono::high_resolution_clock::now();
-        load_time = std::chrono::duration_cast<std::chrono::microseconds>(t_load_end_us - t_start_us);
-        printf("%s: AudioEnc Model inference took %8.2f ms\n", __func__, load_time.count() / 1000.0);
-
-        // Number of valid audio tokens after the encoder's 4x temporal subsampling
-        n_audio_tokens = ((actual_len + 1) / 2 + 1) / 2;
-        if (n_audio_tokens > n_audio_tokens_total) {
-            n_audio_tokens = n_audio_tokens_total;
-        }
-        if (n_audio_tokens == 0) {
-            printf("[Warning]: audio too short/empty: %d samples -> 0 valid audio tokens; disabling audio input\n", audio.num_frames);
-        }
-        printf("audio: valid mel frames=%d / %d, valid audio tokens=%zu / %zu\n",
-            actual_len, n_frame, n_audio_tokens, n_audio_tokens_total);
-    }
-    
-    RKLLMInput rkllm_input;
-    memset(&rkllm_input, 0, sizeof(RKLLMInput));
-
-    RKLLMInferParam rkllm_infer_params;
-    memset(&rkllm_infer_params, 0, sizeof(RKLLMInferParam));
-
-    rkllm_infer_params.mode = RKLLM_INFER_GENERATE;
-    rkllm_infer_params.keep_history = 0;
-    // rkllm_set_chat_template(llmHandle, "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n", "<|im_start|>user\n", "<|im_end|>\n<|im_start|>assistant\n");
-
-    if (enable_image) {
-        pre_input.push_back("<image>这张图片中有什么？");
-        pre_input.push_back("<image>What is in the image?");
-    }
-    if (enable_audio && n_audio_tokens != 0) {
-        pre_input.push_back("<audio>这段音频说了什么？");
-        pre_input.push_back("<audio>What did the audio say?");
-    }
-    cout << "\n**********************可输入以下问题对应序号获取回答/或自定义输入********************\n"
-         << endl;
-    for (int i = 0; i < (int)pre_input.size(); i++)
+  auto submit = [&](const std::string& q) {
+    const std::string text = Trim(q);
+    if (text.empty()) return;
     {
-        cout << "[" << i << "] " << pre_input[i] << endl;
+      std::lock_guard<std::mutex> lock(mu);
+      if (!pending.empty()) {
+        std::printf("[main] vlm busy, replace pending with latest\n");
+        pending.pop_back();
+      }
+      pending.push_back(text);
     }
-    cout << "\n*************************************************************************\n"
-         << endl;
+    cv.notify_one();
+  };
 
-    while(true) {
-        std::string input_str;
-        printf("\n");
-        printf("user: ");
-        std::getline(std::cin, input_str);
-        if (input_str == "exit")
-        {
-            break;
-        }
-        if (input_str == "clear")
-        {
-            ret = rkllm_clear_kv_cache(llmHandle, 1, nullptr, nullptr);
-            if (ret != 0)
-            {
-                printf("clear kv cache failed!\n");
-            }
-            continue;
-        }
-        for (int i = 0; i < (int)pre_input.size(); i++)
-        {
-            if (input_str == to_string(i))
-            {
-                input_str = pre_input[i];
-                cout << input_str << endl;
-            }
-        }
+  // ---- VLM 线程 ----
+  std::thread vlm_thread([&]() {
+    while (true) {
+      std::string question;
+      {
+        std::unique_lock<std::mutex> lock(mu);
+        cv.wait(lock, [&]() { return !pending.empty() || !running; });
+        if (!running && pending.empty()) return;
+        question = pending.front();
+        pending.pop_front();
+      }
 
-        bool has_image = enable_image && (input_str.find("<image>") != std::string::npos);
-        bool has_audio = enable_audio && (input_str.find("<audio>") != std::string::npos);
+      std::printf("\n[ask] %s\n", question.c_str());
+      std::fflush(stdout);
 
-        
-        if (has_image && enable_image) {
-            // v1.1:每次提问前：抓当前帧 → 预处理 → 重跑视觉编码器，更新 img_vec;
-            // v1.2:不再现场抓帧，改为"读采集线程维护的最新一帧"
-            cv::Mat frame;
-            if (!camera.get_latest(frame)) {
-                printf("[Warning] no frame yet, skip\n");
-                continue;
-            }
-            //frame 已是 BGR
-                    
-            // 扩方保留（CPU），避免直接 resize 变形
-            cv::Mat square_img = expand2square(frame, cv::Scalar(127.5, 127.5, 127.5));
+      // 每凑够一句就立刻交给 TTS：边生成边播报
+      const auto on_sentence = [&](const std::string& sentence) {
+        if (tts_started) tts.Say(sentence);
+      };
 
-            // RGA：BGR→RGB + resize 448（替代原来的 cvtColor + resize）
-            cv::Mat rgb;
-            if (!rga.to_rgb(square_img, image_width, image_height, &rgb)) {
-                printf("[Warning] rga failed\n");
-                continue;
-            }
-            // // 临时对比：OpenCV 做同样的 BGR→RGB + resize
-            // auto c0 = std::chrono::high_resolution_clock::now();
-            // cv::Mat tmp;
-            // cv::cvtColor(square_img, tmp, cv::COLOR_BGR2RGB);
-            // cv::resize(tmp, tmp, cv::Size(image_width, image_height), 0, 0, cv::INTER_LINEAR);
-            // auto c1 = std::chrono::high_resolution_clock::now();
-            // printf("[OpenCV] in %ld us\n",
-            //     std::chrono::duration_cast<std::chrono::microseconds>(c1 - c0).count());
+      std::string answer;
+      const bool ok = vlm.Ask(question, &answer, on_sentence);
 
-            auto t0 = std::chrono::high_resolution_clock::now();
-            ret = run_imgenc(&rknn_app_ctx, rgb.data, img_vec);
-            auto t1 = std::chrono::high_resolution_clock::now();
-            if (ret != 0) {
-                printf("run_imgenc fail! ret=%d\n", ret);
-                continue;
-            }
-
-            
-
-
-            printf("[ImgEnc] %.2f ms\n",
-                std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.0);
-        }
-
-
-        if (!has_audio && !has_image)
-        {
-            rkllm_input.input_type = RKLLM_INPUT_PROMPT;
-            rkllm_input.role = "user";
-            rkllm_input.prompt_input = (char*)input_str.c_str();
-        } else {
-            rkllm_input.input_type = RKLLM_INPUT_MULTIMODAL;
-            rkllm_input.role = "user";
-            rkllm_input.multimodal_input.prompt = (char*)input_str.c_str();
-            if (has_image && enable_image) {
-                rkllm_input.multimodal_input.image.image_embed = img_vec;
-                rkllm_input.multimodal_input.image.n_image_tokens = n_image_tokens;
-                rkllm_input.multimodal_input.image.n_image = 1;
-                rkllm_input.multimodal_input.image.image_start = img_start;
-                rkllm_input.multimodal_input.image.image_end = img_end;
-                rkllm_input.multimodal_input.image.image_content = img_content;
-                rkllm_input.multimodal_input.image.image_height = image_height;
-                rkllm_input.multimodal_input.image.image_width = image_width;
-            }
-            if (has_audio && enable_audio) {
-                rkllm_input.multimodal_input.audio.audio_embed = audio_vec;
-                rkllm_input.multimodal_input.audio.n_audio_tokens = n_audio_tokens;
-                rkllm_input.multimodal_input.audio.n_audio = 1;
-                rkllm_input.multimodal_input.audio.audio_start = audio_start;
-                rkllm_input.multimodal_input.audio.audio_end = audio_end;
-                rkllm_input.multimodal_input.audio.audio_content = audio_content;
-            }
-        }
-        printf("robot: ");
-        rkllm_run(llmHandle, &rkllm_input, &rkllm_infer_params, NULL);
+      if (ok) {
+        std::printf("[answer] %s\n", answer.c_str());
+        std::fflush(stdout);
+        // 注意：这里不要再 tts.Say(answer)，否则整段会重念一遍
+      } else {
+        std::fprintf(stderr, "[main] ask failed\n");
+      }
     }
+  });
 
-exit_cleanup:
-    //if (camera.isOpened()) camera.release();   // ★ 新增
-    camera.stop();      // ★ 停采集线程（如果 start 过）
-    if (enable_image) {
-        ret = release_imgenc(&rknn_app_ctx);
-        if (ret != 0) {
-            printf("release_imgenc fail! ret=%d\n", ret);
-        }
-        if (img_vec) {
-            free(img_vec);
-            img_vec = NULL;
-        }
+  // ---- 语音线程 ----
+  voice::Engine engine;
+  bool voice_started = false;
+  if (args.voice_enabled) {
+    if (!engine.Init(args.voice)) {
+      std::fprintf(stderr, "[main] voice init failed\n");
+    } else if (!engine.Start(submit)) {
+      std::fprintf(stderr, "[main] voice start failed\n");
+    } else {
+      voice_started = true;
+      std::printf("[main] voice enabled\n");
     }
-    if (enable_audio) {
-        ret = release_audioenc(&rknn_audio_ctx);
-        if (ret != 0) {
-            printf("release_audioenc fail! ret=%d\n", ret);
-        }
-        if (audio_vec) {
-            free(audio_vec);
-            audio_vec = NULL;
-        }
-        if (audio.data) {
-            free(audio.data);
-            audio.data = NULL;
-        }
-    }
-    rkllm_destroy(llmHandle);
+  } else {
+    std::printf("[main] voice disabled (typing only)\n");
+  }
 
-    return exit_code;
+  // ---- stdin 线程：保留打字提问 ----
+  std::thread stdin_thread([&]() {
+    std::string line;
+    while (running) {
+      if (!std::getline(std::cin, line)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        continue;
+      }
+      line = Trim(line);
+      if (line == "exit") {
+        running = false;
+        cv.notify_all();
+        break;
+      }
+      if (line == "clear") { vlm.ClearKvCache(); continue; }
+      if (!line.empty()) submit(line);
+    }
+  });
+
+  std::printf("[main] ready. 说\"你好小智\"提问，或直接打字。exit 退出。\n");
+
+  while (g_running != 0 && running) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  }
+
+  std::printf("\n[main] shutting down...\n");
+  if (tts_started) tts.Stop();
+  if (voice_started) engine.Stop();
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    running = false;
+  }
+  cv.notify_all();
+  if (vlm_thread.joinable()) vlm_thread.join();
+  if (stdin_thread.joinable()) stdin_thread.join();
+  vlm.Stop();
+  std::printf("[main] bye\n");
+  return 0;
 }
