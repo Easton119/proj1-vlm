@@ -6,6 +6,7 @@
 #   bash scripts/run_demo.sh --tts            # VLM + 播报（打字问，语音答）
 #   bash scripts/run_demo.sh --voice          # VLM + 语音提问（只有文字回答）
 #   bash scripts/run_demo.sh --voice --tts    # 完整闭环
+#   bash scripts/run_demo.sh --push           # 加 RTMP 推流（默认 640x480@15fps）
 #
 # 环境变量覆盖：
 #   SHERPA_ROOT KWS_DIR KEYWORDS_FILE ASR_DIR VAD_MODEL MIC_DEVICE
@@ -36,14 +37,23 @@ TTS_DIR="${TTS_DIR:-$PROJ_DIR/models/vits-melo-tts-zh_en}"
 TTS_DEVICE="${TTS_DEVICE:-plughw:1,0}"
 TTS_THREADS="${TTS_THREADS:-4}"
 
+# 推流（只在 --push 时才使用）
+RTMP_URL="${RTMP_URL:-rtmp://192.168.137.1:1935/live/cam}"
+PUSH_FPS="${PUSH_FPS:-15}"
+PUSH_BITRATE="${PUSH_BITRATE:-1500000}"
+CAM_W="${CAM_W:-640}"
+CAM_H="${CAM_H:-480}"
+
 # ---- 参数：--voice / --tts 由脚本消费，其余原样透传给 demo ----
 WITH_VOICE=0
 WITH_TTS=0
+WITH_PUSH=0
 EXTRA=()
 for arg in "$@"; do
   case "$arg" in
     -v|--voice) WITH_VOICE=1 ;;
     -t|--tts)   WITH_TTS=1 ;;
+    -p|--push)  WITH_PUSH=1 ;;
     -h|--help)  head -11 "$0"; exit 0 ;;
     *) EXTRA+=("$arg") ;;
   esac
@@ -113,6 +123,20 @@ if [ "$WITH_TTS" -eq 1 ]; then
   echo "[run_demo] 语音播报: 开（$TTS_DIR -> $TTS_DEVICE）"
 else
   echo "[run_demo] 语音播报: 关"
+fi
+
+# ---- 推流 ----
+if [ "$WITH_PUSH" -eq 1 ]; then
+  ARGS+=(
+    "--push=$RTMP_URL"
+    "--push-fps=$PUSH_FPS"
+    "--push-bitrate=$PUSH_BITRATE"
+    "--width=$CAM_W"
+    "--height=$CAM_H"
+  )
+  echo "[run_demo] RTMP 推流: 开（$RTMP_URL, ${CAM_W}x${CAM_H}@${PUSH_FPS}fps）"
+else
+  echo "[run_demo] RTMP 推流: 关"
 fi
 
 cd "$BUILD_DIR"

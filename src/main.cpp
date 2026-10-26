@@ -8,8 +8,10 @@
 // 关键：语音识别出的文本在 VlmEngine::Ask 里会被加上 "<image>" 前缀，
 // 否则 RKLLM 不会把它当多模态输入，模型就不会看图。
 
+#include <atomic>
 #include <condition_variable>
 #include <csignal>
+#include <ctime>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -23,6 +25,9 @@
 #include "vlm_engine.h"
 #include "voice_engine.h"
 #include "tts_engine.h"
+#include "mpp_encoder.h"
+#include "rtmp_publisher.h"
+#include <opencv2/opencv.hpp>
 
 namespace {
 
@@ -35,6 +40,12 @@ struct Args {
   voice::Config voice;
   bool tts_enabled = false;     // 新增
   TtsConfig tts;                // 新增
+  // ---- 阶段⑤：MPP 硬编码推流 ----
+  bool push_enabled = false;
+  std::string push_url;         // rtmp://host:1935/app/stream 或 /tmp/test.flv
+  int push_fps = 15;
+  int push_bitrate = 1500000;   // bps
+  bool push_timestamp = false;  // 把本机时间烧进画面（量端到端延迟用）
 };
 
 void PrintUsage(const char* p) {
@@ -51,6 +62,9 @@ void PrintUsage(const char* p) {
       "    --vad-model= [--device=plughw:2,0] [--language=zh]\n"
       "    [--kws-threshold=0.25] [--vad-threshold=0.25]\n"
       "    [--command-timeout-ms=8000] [--cooldown-ms=1500]\n",
+      "  Push (MPP H.264 -> FLV/RTMP):\n"
+      "    --push=<url|/path/x.flv> [--push-fps=15]\n"
+      "    [--push-bitrate=1500000] [--push-timestamp]\n",
       p);
 }
 
@@ -60,6 +74,7 @@ int ParseArgs(int argc, char** argv, Args* a) {
     std::string arg = argv[i];
     if (arg == "--voice") { a->voice_enabled = true; continue; }
     if (arg == "--tts") { a->tts_enabled = true; continue; }
+    if (arg == "--push-timestamp") { a->push_timestamp = true; continue; }
     if (arg.rfind("--", 0) != 0) {
       std::fprintf(stderr, "unexpected argument: %s\n", arg.c_str());
       return 0;
@@ -107,6 +122,9 @@ int ParseArgs(int argc, char** argv, Args* a) {
     else if (key == "tts-sid") a->tts.sid = std::atoi(value.c_str());
     else if (key == "tts-speed") a->tts.speed = static_cast<float>(std::atof(value.c_str()));
     else if (key == "tts-dump") a->tts.dump_dir = value;
+    else if (key == "push") { a->push_enabled = true; a->push_url = value; }
+    else if (key == "push-fps") a->push_fps = std::atoi(value.c_str());
+    else if (key == "push-bitrate") a->push_bitrate = std::atoi(value.c_str());
     else { std::fprintf(stderr, "unknown option: --%s\n", key.c_str()); return 0; }
   }
   if (a->vlm.llm_model.empty() || a->vlm.vision_model.empty()) return 0;
@@ -129,6 +147,10 @@ int ParseArgs(int argc, char** argv, Args* a) {
       std::fprintf(stderr, "[tts] need --tts-model/--tts-lexicon/--tts-tokens\n");
       return 0;
     }
+  }
+  if (a->push_enabled && a->push_url.empty()) {
+    std::fprintf(stderr, "[push] --push needs <url|file>\n");
+    return 0;
   }
   return 1;
 }
@@ -165,6 +187,125 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "[main] tts init failed, continue without TTS\n");
     } else {
       tts_started = true;
+    }
+  }
+
+  // ---- 推流（阶段⑤：MPP H.264 + FLV/RTMP）----
+  // 设计要点：推流线程按固定节奏向 VLM 引擎取"当前最新帧"，取不到就等 5 ms。
+  //   - 不经过采集线程 → 推流不会拖慢采集
+  //   - 不共享队列    → 网络阻塞时不会把帧积压（天然丢帧，始终直播最新画面）
+  //   - 单独线程      → VLM 推理期间推流照常进行，互不阻塞
+  MppEncoder push_enc;
+  RtmpPublisher push_pub;
+  std::atomic<bool> push_running{false};
+  std::thread push_thread;
+  bool push_started = false;
+
+  if (args.push_enabled) {
+    const int pw = args.vlm.camera_width;
+    const int ph = args.vlm.camera_height;
+    if (!push_enc.Init(pw, ph, args.push_fps, args.push_bitrate)) {
+      std::fprintf(stderr, "[push] encoder init failed, push disabled\n");
+    } else if (!push_pub.Open(args.push_url, pw, ph, args.push_fps,
+                              push_enc.header())) {
+      std::fprintf(stderr, "[push] open %s failed, push disabled\n",
+                   args.push_url.c_str());
+    } else {
+      push_started = true;
+      push_running = true;
+      push_thread = std::thread([&]() {
+        const int fps = args.push_fps > 0 ? args.push_fps : 15;
+        const auto period = std::chrono::microseconds(1000000 / fps);
+        auto next = std::chrono::steady_clock::now();
+        auto last_report = next;
+        int64_t idx = 0;
+        int64_t sent = 0;
+        int64_t sent_at_report = 0;
+        int64_t bytes_at_report = 0;
+        int64_t enc_fail = 0;
+        int64_t lag_skip = 0;
+        int64_t reconnects = 0;
+        std::vector<uint8_t> pkt;
+        cv::Mat frame;
+
+        while (push_running.load()) {
+          if (!vlm.LatestFrame(&frame)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            continue;
+          }
+          if (frame.cols != args.vlm.camera_width ||
+              frame.rows != args.vlm.camera_height) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
+          }
+
+          if (args.push_timestamp) {
+            const auto now = std::chrono::system_clock::now();
+            const std::time_t t = std::chrono::system_clock::to_time_t(now);
+            const int ms = static_cast<int>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now.time_since_epoch()).count() % 1000);
+            std::tm tmv;
+            localtime_r(&t, &tmv);
+            char stamp[48];
+            std::snprintf(stamp, sizeof(stamp), "%02d:%02d:%02d.%03d",
+                          tmv.tm_hour, tmv.tm_min, tmv.tm_sec, ms);
+            cv::putText(frame, stamp, cv::Point(10, 32),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.9, cv::Scalar(0, 0, 255), 2);
+          }
+
+          bool key = false;
+          if (push_enc.Encode(frame, &pkt, &key)) {
+            if (!pkt.empty()) {
+              const int64_t pts_us = idx * 1000000LL / fps;
+              if (push_pub.Write(pkt.data(), pkt.size(), pts_us, key)) {
+                ++sent;
+              } else {
+                std::fprintf(stderr, "[push] write failed, reconnecting...\n");
+                push_pub.Close();
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                if (push_pub.Open(args.push_url, args.vlm.camera_width,
+                                  args.vlm.camera_height, fps,
+                                  push_enc.header())) {
+                  ++reconnects;
+                } else {
+                  std::fprintf(stderr, "[push] reopen failed, retry later\n");
+                }
+              }
+            }
+          } else {
+            ++enc_fail;
+          }
+          ++idx;
+
+          const auto now2 = std::chrono::steady_clock::now();
+          const double win =
+              std::chrono::duration<double>(now2 - last_report).count();
+          if (win >= 1.0) {
+            const double kbps =
+                (push_pub.bytes_written() - bytes_at_report) * 8.0 / win / 1000.0;
+            std::printf(
+                "[push] fps=%.1f kbps=%.0f sent=%lld lagskip=%lld enc_fail=%lld "
+                "reconn=%lld\n",
+                (sent - sent_at_report) / win, kbps, (long long)sent,
+                (long long)lag_skip, (long long)enc_fail,
+                (long long)reconnects);
+            std::fflush(stdout);
+            last_report = now2;
+            sent_at_report = sent;
+            bytes_at_report = push_pub.bytes_written();
+          }
+
+          next += period;
+          const auto after = std::chrono::steady_clock::now();
+          if (after > next + period) {
+            next = after;   // 落后太多就重置节奏，绝不追帧积压
+            ++lag_skip;
+          }
+          std::this_thread::sleep_until(next);
+        }
+        std::printf("[push] thread exit\n");
+      });
     }
   }
 
@@ -265,6 +406,14 @@ int main(int argc, char** argv) {
   std::printf("\n[main] shutting down...\n");
   if (tts_started) tts.Stop();
   if (voice_started) engine.Stop();
+  
+  if (push_started) {                 // ★ 先停推流：它依赖 VLM 的摄像头
+    push_running = false;
+    if (push_thread.joinable()) push_thread.join();
+    push_pub.Close();
+    push_enc.Release();
+  }
+  
   {
     std::lock_guard<std::mutex> lock(mu);
     running = false;

@@ -3,16 +3,18 @@
 #include <RgaUtils.h>
 #include <mutex>
 #include <iostream>
+#include <chrono>
+#include "rga_lock.h"
 
 // RGA 只有一个硬件，多线程同时用会崩，全局锁串行化
-static std::mutex g_rga_mutex;
+//static std::mutex g_rga_mutex;//删掉这一行，改成rga_lock引用
 
 bool RgaConverter::to_rgb(const cv::Mat& bgr, int dst_w, int dst_h, cv::Mat* rgb) {
     if (bgr.empty() || !rgb) return false;
 
     rgb->create(dst_h, dst_w, CV_8UC3);
 
-    std::lock_guard<std::mutex> lock(g_rga_mutex);
+    std::lock_guard<std::mutex> lock(GlobalRgaMutex());
 
     int src_size = bgr.step[0] * bgr.rows;
     int dst_size = rgb->step[0] * rgb->rows;

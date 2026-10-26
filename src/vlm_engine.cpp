@@ -383,6 +383,10 @@ void VlmEngine::ClearKvCache() {
     rkllm_clear_kv_cache(impl_->llm, 1, nullptr, nullptr);
   }
 }
+bool VlmEngine::LatestFrame(cv::Mat* out) {
+  if (impl_ == nullptr || out == nullptr || !impl_->camera_started) return false;
+  return impl_->camera.get_latest(*out);
+}
 
 void VlmEngine::Stop() {
   if (impl_ == nullptr) return;

@@ -13,6 +13,7 @@
 
 #include <string>
 #include <functional>
+#include <opencv2/core.hpp>
 
 struct VlmConfig {
   std::string llm_model;                        // master_w8a8_rk3588.rkllm
@@ -46,6 +47,8 @@ class VlmEngine {
            SentenceHandler on_sentence = nullptr);
 
   void ClearKvCache();
+  // ★ 新增：给推流线程取"当前最新一帧"（只读，不触发推理、不影响 VLM 路径）
+  bool LatestFrame(cv::Mat* out);
 
  private:
   struct Impl;
